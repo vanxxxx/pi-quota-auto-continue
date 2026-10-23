@@ -1,7 +1,7 @@
 {
   "name": "pi-quota-auto-continue",
-  "version": "0.2.0",
-  "description": "Native Codex OAuth quota recovery for Oh My Pi without continuation messages",
+  "version": "0.3.0",
+  "description": "Native Codex and Claude Code OAuth quota recovery for Oh My Pi without continuation messages",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/vanxxxx/pi-quota-auto-continue.git"
@@ -22,6 +22,8 @@
     "omp",
     "pi-extension",
     "codex",
+    "claude-code",
+    "anthropic",
     "quota",
     "auto-continue"
   ],

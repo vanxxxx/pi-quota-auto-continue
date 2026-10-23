@@ -1,26 +1,35 @@
 # Pi Quota Auto Continue
 
-Message-free Codex subscription quota recovery for **Oh My Pi (OMP)**. When a task stops on a quota error, the extension monitors the current account's quota windows and retries the interrupted turn using OMP's native retry mechanism. It never sends a `continue` prompt or adds a hidden custom message.
+Message-free **Codex and Claude Code** subscription quota recovery for **Oh My Pi (OMP)**. When a task stops on a quota error, the extension monitors the current account's quota windows and retries the interrupted turn using OMP's native retry mechanism. It never sends a `continue` prompt or adds a hidden custom message.
 
 [npm package](https://www.npmjs.com/package/pi-quota-auto-continue) · [Source code](https://github.com/vanxxxx/pi-quota-auto-continue) · [Report an issue](https://github.com/vanxxxx/pi-quota-auto-continue/issues)
 
 ## Features
 
 - Native retry in the original session, without adding conversation messages.
-- Notifications showing the estimated next automatic continuation time, or an explicit unknown time when the provider supplies no usable reset information.
-- Silent background quota checks every **10 minutes** by default, plus a check at the estimated reset time.
+- One consolidated quota notice per interruption episode; later schedule changes update status silently.
+- Silent background quota checks every **30 minutes** by default; `interval 0` disables recurring checks while preserving a known reset deadline.
 - Early recovery detection, including an account becoming available before its previously reported reset time.
-- Five-hour and weekly quota windows, with model-specific quota buckets when provided.
+- Five-hour and weekly subscription windows, including the applicable Claude model-family limits.
 - No npm dependencies, extra plugins, build step, or separate background service.
 
 ## Requirements and Compatibility
 
 - **OMP 18.12.1**, or a compatible OMP release exposing `pi.pi.AgentRegistry` and native `AgentSession.retry()`. Version 18.12.1 was exercised locally.
-- A current OpenAI Codex model authenticated through subscription OAuth and using the official `https://chatgpt.com` origin.
-- A running OMP session. Monitoring does not survive process exit.
+- A current Codex or Anthropic Claude model authenticated through subscription OAuth and using its official provider origin.
+- A running OMP session for timers. Reopening the same failed session restores saved recovery state and checks availability again.
 - Node.js **22.6 or newer** for the development commands below. OMP's bundled runtime loads the extension itself.
 
 **Stock Pi compatibility:** the package includes Pi-style discovery metadata, but stock Pi's extension API does not expose the OMP registry/native retry bridge used here. Automatic continuation is therefore not supported on stock Pi. Unsupported hosts report the limitation rather than falling back to a user message or a hidden message.
+
+### Supported Subscriptions
+
+| Subscription | OMP provider | Required model origin | Usage endpoint |
+| --- | --- | --- | --- |
+| OpenAI Codex | `openai-codex` / OAuth-backed `openai` | `https://chatgpt.com` | `https://chatgpt.com/backend-api/wham/usage` |
+| Claude Code | `anthropic` | `https://api.anthropic.com` | `https://api.anthropic.com/api/oauth/usage` |
+
+Claude Code support means the Claude subscription configured in OMP with Claude Code OAuth credentials. It does not control independent `claude` CLI processes, redeem saved reset credits, buy additional quota, or enable extra usage. It waits for a provider reset or earlier confirmed recovery, then retries the interrupted OMP task. Regular Anthropic API keys are rejected even when the account also has a saved OAuth login.
 
 ## Install Command
 
@@ -38,24 +47,24 @@ Alternatively, install the package into a local project and load it explicitly:
 
 ```sh
 npm install pi-quota-auto-continue
-omp -e ./node_modules/pi-quota-auto-continue
+omp --no-extensions -e ./node_modules/pi-quota-auto-continue
 ```
 
-Run both commands from the same project directory. To enable it persistently, add the installed package's absolute directory path to the `extensions` array in the active OMP profile's `config.yml`, then restart OMP. No global npm installation is required.
+Run both commands from the same project directory. This isolated launch disables ambient extension discovery so an older installed copy cannot load alongside the local package. For normal persistent use with your other extensions, prefer `omp install pi-quota-auto-continue`. No global npm installation is required.
 
 ### From a source checkout
 
 Run from the project directory:
 
 ```sh
-omp -e ./src/index.ts
+omp --no-extensions -e ./src/index.ts
 ```
 
-No `npm install` is required. To enable a checkout persistently, add its absolute directory path to the `extensions` array in the active OMP profile's `config.yml` and restart OMP. The package manifest resolves the entry to `src/index.ts`.
+No `npm install` is required. For persistent local development, run `omp plugin link .` from this directory; it replaces the installed copy of this package with a link to the checkout. Restart OMP, and keep the checkout available. Do not load both an installed and an explicit copy of this extension at the same time.
 
 ## Usage
 
-1. Log in to Codex using OMP's normal OAuth login and select an official Codex model.
+1. Log in to Codex or Anthropic using OMP's normal subscription OAuth login and select a model using that provider's official origin.
 2. Run a task normally. Only a failed assistant turn containing a recognized quota error arms automatic recovery; ordinary assistant text mentioning a quota does not.
 3. Keep OMP running. The extension reports the estimated continuation time, monitors availability, and schedules native retry once recovery is confirmed.
 
@@ -67,7 +76,8 @@ Notifications and footer status are UI-only; they are not sent to the model. In 
 | --- | --- |
 | `/quota-resume status` | Show pending continuation/check times, attempt count, latest usage, and the last check error. |
 | `/quota-resume check` | Check usage immediately; retry if a waiting task is eligible and quota has recovered. |
-| `/quota-resume interval 10` | Set the background interval to 10 minutes; accepted range: 0.25–60. |
+| `/quota-resume interval 30` | Set the background interval to 30 minutes; accepted nonzero range: 0.25–60. |
+| `/quota-resume interval 0` | Disable recurring background checks; keep manual checks and a known one-shot reset check. |
 | `/quota-resume on` | Enable automatic recovery for subsequent quota failures. |
 | `/quota-resume off` | Disable automatic recovery and cancel the current wait. |
 | `/quota-resume cancel` | Cancel only the current recovery episode. |
@@ -81,34 +91,46 @@ Use [`examples/quota-auto-continue.json`](examples/quota-auto-continue.json) as 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Enable recovery after a quota failure. |
-| `pollMinutes` | `10` | Background check interval, from 0.25 to 60 minutes. |
+| `pollMinutes` | `30` | Background interval: `0` disables periodic checks, otherwise 0.25–60 minutes. |
 | `resetSlackSeconds` | `5` | Extra time after a reported reset before the scheduled reset check. |
 | `minResumeDelaySeconds` | `20` | Minimum delay after detection before retry; accepted range: 5–600 seconds. |
-| `maxResumesPerEpisode` | `3` | Maximum native retry attempts across consecutive quota failures; accepted range: 1–20. |
+| `maxResumesPerEpisode` | `3` | Maximum accepted native retry attempts across consecutive quota failures; temporary host refusal does not consume an attempt. Accepted range: 1–20. |
 | `resumeAtHintIfUsageUnavailable` | `true` | Allow a bounded retry after an explicit reset hint when the usage endpoint cannot be queried. Set `false` to require confirmed availability. |
 
-The old `continuationPrompt` setting is no longer read or saved. Existing saved polling intervals remain in effect; use `/quota-resume interval 10` to adopt the new default in an existing installation.
+The old `continuationPrompt` setting is no longer read or saved. Existing saved polling intervals remain in effect; use `/quota-resume interval 30` to adopt the new default, or `/quota-resume interval 0` to turn periodic checks off.
+
+Provider selection is automatic from the current model; the same settings and commands apply to Codex and Claude Code. No new configuration keys or dependencies are required.
 
 ## Recovery Behavior
 
 1. Wait for a terminal `agent_end` notification. OMP-managed intermediate recoveries are left to the host.
-2. Validate the provider and OAuth authentication, then query `https://chatgpt.com/backend-api/wham/usage` using runtime credentials supplied by the host.
-3. Interpret windows by their duration, not their field order. A matching model-specific bucket takes precedence. When both five-hour and weekly windows are exhausted, use the later reset as the estimate.
-4. Report the estimated next continuation time and next check time. If the reset is unknown, explicitly report that the continuation time is unknown. Times use the machine's local time zone.
-5. Check silently every 10 minutes by default, or sooner when a known reset plus slack is due. An early provider/account reset can therefore be discovered without waiting for the original reset estimate. A changed continuation estimate is announced; unchanged polls remain silent.
-6. Once availability is confirmed and the minimum delay has elapsed, announce the current retry time, revalidate session ownership, and call the live session's native `retry()`. The host schedules the continuation; accepting retry is not a guarantee that the next provider request succeeds.
-7. If quota blocks the next turn again, report a new schedule. Stop at the configured attempt limit. Successful completion, new user input, session replacement, model changes, explicit cancellation, or shutdown clear the recovery episode as applicable.
+2. Validate the selected provider, official origin, and OAuth credential, then query its fixed usage endpoint. Claude requests use bearer authentication and the `oauth-2025-04-20` protocol beta. Credentials and arbitrary model headers are never forwarded to another host.
+3. For Codex, interpret windows by duration rather than field order; a matching model-specific bucket takes precedence. For Claude, require valid shared five-hour and weekly usage, and also honor the current model family's weekly cap. Both legacy `seven_day_sonnet` / `seven_day_opus` fields and current `limits[]` rows (`session`, `weekly_all`, `weekly_scoped`) are understood. A scoped row's `is_active` flag does not remove that limit. Unknown model families or unrecognized scope labels are handled conservatively. Use the latest reset among exhausted applicable windows; another known model family's cap does not block the selected family.
+4. Combine the failed turn, host retry/reset hints, and the initial usage result into one quota notice. If the reset is unknown, say so explicitly. Times use the machine's local time zone; later changes update footer/status and `/quota-resume status`, not another warning.
+5. Check silently every 30 minutes by default, or sooner when a known reset plus slack is due. With interval `0`, no recurring checks run: an already known reset still gets one check, and `/quota-resume check` remains available. If that check still shows exhaustion without a new future reset, wait for a manual check rather than spin.
+6. Once availability is confirmed and the minimum delay has elapsed, revalidate live session/model ownership and request native `retry()`. Announce continuation only when the host accepts it. If the host is busy, retrying, compacting, or temporarily refuses admission, retain the wait and retry admission later without querying the provider again.
+7. If quota blocks the accepted retry again, update the pending schedule silently. Stop at the configured accepted-attempt limit. Success, new user input, a different model, or explicit cancellation end the episode. Closing OMP stops timers but preserves small, credential-free recovery metadata in the session; reopening the same failed session restores it. Explicit cancellation is also saved, so reopening cannot undo it.
 
 With hint fallback enabled, an unavailable usage endpoint may allow retry at an explicit error/HTTP reset hint, never earlier than a previously observed blocking reset or the minimum delay. This is announced as a hint-based retry, not as confirmed recovery. Without usage data or a reset hint, monitoring continues but no blind retry is sent.
+
+OMP 18.12.1 may separately display `Retry failed ... Provider requested ... exceeds retry.maxDelayMs` before handing control back to the session. That is the host's native retry policy, not an extension timer failure. This extension reads the reported provider wait and owns the later recovery schedule; it does not raise the global retry delay cap, hide the original error, or disable ordinary network/5xx retries.
 
 ## Security and Limitations
 
 - Tokens are obtained through the host's model registry, never by reading `auth.json`. They are sent only to the fixed official HTTPS usage endpoint, with redirects disabled and a 15-second timeout. Credentials are not stored or logged by this extension.
-- API-key accounts, proxy origins, and other vendors are not supported. A quota response describes the current account/model; it cannot establish that a reset affected every account globally. The extension detects availability changes, not the vendor's internal reason for them.
-- The usage endpoint is an undocumented ChatGPT endpoint and may change. Failed checks remain silent in the background and can be inspected with `/quota-resume status`.
+- Regular API-key accounts, proxy origins, and vendors other than the two listed above are not supported. A quota response describes the current account/model; it cannot establish that a reset affected every account globally. The extension detects availability changes, not the vendor's internal reason for them.
+- Both subscription usage endpoints may change without notice. Missing or malformed Claude utilization is not treated as recovered quota, and paid extra-usage fields are not used to authorize retry. Failed checks remain silent in the background and can be inspected with `/quota-resume status`.
 - Native retry uses the same session and does not add a prompt, but it still makes a new provider request and can consume quota. The host controls failed-turn normalization and tool replay; exactly-once external side effects are not guaranteed.
-- OMP's exported registry/session bridge is host-specific, not a portable Pi extension API. A missing bridge or a declined native retry is reported without synthesizing a message.
-- Timers are in-memory and do not keep a headless process alive. This package does not restart OMP or recover a wait after OMP has exited.
+- OMP's exported registry/session bridge is host-specific, not a portable Pi extension API. Unsupported hosts report the limitation; temporary native retry refusal retains the interrupted task instead of losing it.
+- Timers do not keep a headless process alive and do not restart OMP. Recovery can resume only after the same saved session is reopened. Older sessions without extension metadata can be re-armed only when their latest conversational turn is a genuine quota error; a new user turn, success, or saved cancellation prevents replay.
+
+## Performance
+
+- No quota HTTP requests or timers while there is no pending quota interruption.
+- At most one pending timer and one in-flight quota probe per session. Unchanged schedules do not append new session metadata or emit notifications.
+- During a full day of unchanged exhaustion with no earlier reset, the default interval makes 48 periodic checks plus the initial check, rather than the previous 144 plus the initial check.
+- Interval `0` makes only the initial check unless a known reset becomes due or the user requests a manual check. With no reset hint, it leaves no active timer.
+- Host-admission deferrals reuse the confirmed recovery result and do not repeatedly query usage. These numbers concern this extension; OMP's own usage polling is separate.
 
 ## Development
 
@@ -119,13 +141,14 @@ npm run pack:check
 
 Tests use Node's built-in runner and fake timers; no network access or installed dependencies are required. GitHub Actions runs the test suite and checks the npm package contents on Node 22.6.0, 22.x, and 24.x.
 
-The native host integration was also exercised with the local OMP 18.12.1 executable and a credential-free synthetic provider: one quota failure, one native retry, one successful response, one original user message, and zero custom messages. This verifies host integration, not live ChatGPT endpoint availability.
+Native host integration was exercised with the local OMP 18.12.1 executable and credential-free synthetic Codex and Claude providers. Each recovered after one quota failure with one quota notice, one accepted native retry, one original user message, and zero custom messages. A separate two-process test saved a failed session, closed OMP, reopened that session, and recovered without new user input or a repeated quota notice. The Claude flow was also exercised in the actual terminal UI. These checks verify host integration, not live provider usage-endpoint availability.
 
 ### Project Structure
 
 ```text
 src/
   index.ts                        Extension lifecycle, monitoring, notifications, native retry
+  quota-provider.mjs              Official-origin Codex and Claude OAuth usage requests
   quota-core.mjs                  Quota parsing and reset hints
 examples/
   quota-auto-continue.json         Supported configuration settings
@@ -178,4 +201,6 @@ No license is currently declared. Public availability alone does not grant permi
 
 - [OMP extension loading and package manifests](https://github.com/can1357/oh-my-pi/blob/main/docs/extension-loading.md)
 - [OMP 18.12.1 native turn recovery](https://github.com/can1357/oh-my-pi/blob/v18.12.1/packages/coding-agent/src/session/turn-recovery.ts)
+- [OMP 18.12.1 Claude usage payloads](https://github.com/can1357/oh-my-pi/blob/v18.12.1/packages/ai/src/usage/claude.ts)
+- [OMP 18.12.1 Claude OAuth account routes](https://github.com/can1357/oh-my-pi/blob/v18.12.1/packages/ai/src/usage/claude-api.ts)
 - [Pi extension API](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts)

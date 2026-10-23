@@ -64,11 +64,74 @@ export function extractQuota(payload, modelId = '', now = Date.now()) {
   return { windows, blocked, available, isRateBlocked, nextResetAt: resetTimes.length ? Math.max(...resetTimes) : null };
 }
 
+function claudeModelFamily(value) {
+  const matches = String(value ?? '').toLowerCase().match(/(?:^|[^a-z])(opus|sonnet|haiku|fable|mythos)(?=$|[^a-z])/g) ?? [];
+  const families = new Set(matches.map((match) => match.replace(/^[^a-z]+/, '')));
+  return families.size === 1 ? families.values().next().value : null;
+}
+
+function parseClaudeWindow(value, type, label, percentKey = 'utilization') {
+  const bucket = object(value);
+  const percent = bucket?.[percentKey];
+  // The OAuth API reports percentages, not fractions; strings/null are not evidence of capacity.
+  const usedPercent = typeof percent === 'number' && Number.isFinite(percent) && percent >= 0 ? percent : null;
+  const reset = bucket?.resets_at;
+  const resetAt = typeof reset === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/i.test(reset)
+    ? epochMs(reset) : null;
+  return { type, label, seconds: type === '5h' ? 18000 : 604800, usedPercent, resetAt, exhausted: usedPercent !== null && usedPercent >= 100 };
+}
+
+/** Parse subscription gates only; extra_usage/spend and reset credits never establish recovery. */
+export function extractClaudeQuota(payload, modelId = '', now = Date.now()) {
+  const root = object(payload);
+  if (!root) return null;
+  const windows = [];
+  let complete = true;
+  let fiveHourSeen = false;
+  let weeklySeen = false;
+  const family = claudeModelFamily(modelId);
+  const addShared = (value, type, percentKey) => {
+    windows.push(parseClaudeWindow(value, type, type, percentKey));
+    if (type === '5h') fiveHourSeen = true;
+    else weeklySeen = true;
+  };
+  const addScoped = (value, displayName, percentKey) => {
+    const scopeFamily = claudeModelFamily(displayName);
+    // Unknown/ambiguous models or scopes must not silently bypass a potentially relevant cap.
+    if (family && scopeFamily && family !== scopeFamily) return;
+    windows.push(parseClaudeWindow(value, 'week', `week (${displayName || 'model scope'})`, percentKey));
+  };
+  if (root.five_hour != null) addShared(root.five_hour, '5h');
+  if (root.seven_day != null) addShared(root.seven_day, 'week');
+  // Null legacy model buckets mean no reported cap; current APIs put scoped caps in limits[].
+  if (root.seven_day_sonnet != null) addScoped(root.seven_day_sonnet, 'Sonnet');
+  if (root.seven_day_opus != null) addScoped(root.seven_day_opus, 'Opus');
+  if (root.limits != null) {
+    if (!Array.isArray(root.limits)) complete = false;
+    else for (const value of root.limits) {
+      const entry = object(value);
+      if (entry?.kind === 'session') addShared(entry, '5h', 'percent');
+      else if (entry?.kind === 'weekly_all') addShared(entry, 'week', 'percent');
+      else if (entry?.kind === 'weekly_scoped') {
+        const displayName = object(object(entry.scope)?.model)?.display_name;
+        addScoped(entry, typeof displayName === 'string' ? displayName.trim() : '', 'percent');
+      } else complete = false;
+      // is_active ranks the currently binding cap; false does not make a window irrelevant.
+    }
+  }
+  const blocked = windows.filter((window) => window.exhausted);
+  // Never infer recovery from the clock: a passed reset still needs fresh utilization evidence.
+  const available = complete && fiveHourSeen && weeklySeen && blocked.length === 0
+    && windows.every((window) => window.usedPercent !== null);
+  const resetTimes = blocked.map((window) => window.resetAt).filter((at) => at !== null);
+  return { windows, blocked, available, isRateBlocked: blocked.length > 0, nextResetAt: resetTimes.length ? Math.max(...resetTimes) : null };
+}
+
 export function isQuotaError(error) {
   const text = String(error ?? '');
   if (!text) return false;
-  if (/insufficient[_ ]quota|insufficient[_ ]balance|billing|payment|monthly limit|model_not_in_plan|unauthorized|invalid[_ ]api[_ ]key|expired token|login required|subscription required|credit card/i.test(text)) return false;
-  return /(?:\b429\b|rate[_ -]?limit[_ -]?(?:error|reached|exceeded)|usage[_ -]?limit|too many requests|quota exceeded|(?:5[ -]?hour|weekly|week|5h)[^\n]{0,80}(?:limit|reset|quota)|(?:limit|quota)[^\n]{0,80}(?:5[ -]?hour|weekly|week|5h))/i.test(text);
+  if (/insufficient[_ ]quota|insufficient[_ ]balance|insufficient[_ ]credits|billing|payment|monthly limit|spend(?:ing)?[_ -]?(?:limit|cap)|credits_required|usage credits are required|credit balance|model_not_in_plan|unauthorized|forbidden|authentication[_ -]error|permission[_ -]error|invalid[_ ]api[_ ]key|expired token|(?:oauth|access)[_ ]token[^\n]{0,40}expired|login required|subscription required|credit card/i.test(text)) return false;
+  return /(?:\b429\b|rate[_ -]?limit[_ -]?(?:error|reached|exceeded)|usage[_ -]?limit|\bhit your (?:(?:session|weekly|usage|opus|sonnet)\s+)?limit\b|\busage preflight blocked:\s*usage depleted\b|too many requests|quota exceeded|(?:5[ -]?hour|weekly|week|5h)[^\n]{0,80}(?:limit|reset|quota)|(?:limit|quota)[^\n]{0,80}(?:5[ -]?hour|weekly|week|5h))/i.test(text);
 }
 
 export function parseResetHint(error, now = Date.now()) {
@@ -83,6 +146,12 @@ export function parseResetHint(error, now = Date.now()) {
   for (const match of text.matchAll(rel)) {
     const factor = /^d/i.test(match[2]) ? 86400000 : /^h/i.test(match[2]) ? 3600000 : /^m/i.test(match[2]) ? 60000 : 1000;
     candidates.push(now + Number(match[1]) * factor);
+  }
+  // OMP reports the provider wait separately from its much smaller retry delay cap.
+  const requested = /Provider requested\s+(\d+(?:\.\d+)?)ms wait,\s*exceeds retry\.maxDelayMs/gi;
+  for (const match of text.matchAll(requested)) {
+    const delay = Number(match[1]);
+    if (Number.isFinite(delay) && delay >= 0) candidates.push(now + delay);
   }
   // When several quota windows are reported, resume only after the latest one.
   return candidates.length ? Math.max(...candidates) : null;

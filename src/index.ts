@@ -1,12 +1,14 @@
-/** Codex OAuth quota monitoring with native, message-free retry. */
+/** Subscription quota monitoring with native, message-free retry. */
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { extractQuota, isQuotaError, parseResetHint, humanTime } from './quota-core.mjs';
+import { isQuotaError, parseResetHint, humanTime } from './quota-core.mjs';
+import { checkProvider, fetchQuota, headerValue, UnsupportedQuotaProviderError } from './quota-provider.mjs';
 
+const STATE_TYPE = 'quota-auto-continue';
 const DEFAULTS = {
   enabled: true,
-  pollMinutes: 10,
+  pollMinutes: 30,
   resetSlackSeconds: 5,
   minResumeDelaySeconds: 20,
   maxResumesPerEpisode: 3,
@@ -18,9 +20,8 @@ function loadConfig(path) {
   try {
     const value = JSON.parse(readFileSync(path, 'utf8'));
     if (!value || typeof value !== 'object' || Array.isArray(value)) return cfg;
-    // Only persist supported settings; old continuation prompts are no longer used.
     for (const key of Object.keys(DEFAULTS)) if (Object.hasOwn(value, key)) cfg[key] = value[key];
-    cfg.pollMinutes = Number.isFinite(cfg.pollMinutes) ? Math.max(0.25, Math.min(60, cfg.pollMinutes)) : 10;
+    cfg.pollMinutes = cfg.pollMinutes === 0 ? 0 : Number.isFinite(cfg.pollMinutes) ? Math.max(0.25, Math.min(60, cfg.pollMinutes)) : 30;
     cfg.resetSlackSeconds = Number.isFinite(cfg.resetSlackSeconds) ? Math.max(0, Math.min(120, cfg.resetSlackSeconds)) : 5;
     cfg.minResumeDelaySeconds = Number.isFinite(cfg.minResumeDelaySeconds) ? Math.max(5, Math.min(600, cfg.minResumeDelaySeconds)) : 20;
     cfg.maxResumesPerEpisode = Number.isInteger(cfg.maxResumesPerEpisode) ? Math.max(1, Math.min(20, cfg.maxResumesPerEpisode)) : 3;
@@ -31,58 +32,14 @@ function loadConfig(path) {
 }
 
 function asError(message) {
-  if (message?.role !== 'assistant' || (message.stopReason !== 'error' && !message.errorMessage)) return null;
+  if (message?.role !== 'assistant' || message.stopReason !== 'error') return null;
   const error = String(message.errorMessage ?? '');
   return isQuotaError(error) ? error : null;
 }
 
-function headerValue(headers, name) {
-  for (const [key, value] of Object.entries(headers || {})) {
-    if (key.toLowerCase() === name.toLowerCase() && typeof value === 'string') return value;
-  }
-  return undefined;
-}
-
-function accountIdFromJwt(accessToken) {
-  try {
-    const payload = JSON.parse(Buffer.from(accessToken.split('.')[1], 'base64url').toString('utf8'));
-    const account = payload['https://api.openai.com/auth']?.chatgpt_account_id ?? payload.chatgpt_account_id;
-    return typeof account === 'string' && /^[a-zA-Z0-9_-]{5,128}$/.test(account) ? account : undefined;
-  } catch { return undefined; }
-}
-
-function checkProvider(ctx) {
-  const model = ctx.model;
-  if (!model || !['openai-codex', 'openai'].includes(model.provider) || !ctx.modelRegistry?.isUsingOAuth?.(model)) {
-    throw new Error('The current model must use Codex subscription OAuth.');
-  }
-  let base;
-  try { base = new URL(model.baseUrl); } catch { throw new Error('Cannot verify the provider origin.'); }
-  if (base.protocol !== 'https:' || base.hostname !== 'chatgpt.com' || base.port || base.username || base.password) {
-    throw new Error('Quota monitoring requires the official https://chatgpt.com origin.');
-  }
-}
-
-async function fetchCodexQuota(ctx) {
-  checkProvider(ctx);
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-  if (!auth?.ok || typeof auth.apiKey !== 'string' || !auth.apiKey) throw new Error('No active OAuth credential is available.');
-  const accountId = headerValue(auth.headers, 'chatgpt-account-id') ?? accountIdFromJwt(auth.apiKey);
-  const headers = { Authorization: `Bearer ${auth.apiKey}`, Accept: 'application/json' };
-  if (accountId && /^[a-zA-Z0-9_-]{5,128}$/.test(accountId)) headers['ChatGPT-Account-Id'] = accountId;
-  // Never forward credentials to a proxy, follow redirects, or log tokens.
-  const response = await fetch('https://chatgpt.com/backend-api/wham/usage', {
-    method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) throw new Error(`Quota endpoint HTTP ${response.status}`);
-  const quota = extractQuota(await response.json(), String(ctx.model.id ?? ''));
-  if (!quota) throw new Error('The provider returned no recognizable quota windows.');
-  return quota;
-}
-
 function fmtQuota(quota) {
   if (!quota) return 'No quota data available.';
-  return `${quota.windows.map((w) => `${w.type}: ${w.usedPercent === null ? 'unknown usage' : w.usedPercent.toFixed(1) + '% used'}; reset ${humanTime(w.resetAt)}`).join(' | ')} | ${quota.available ? 'available' : 'recovery not confirmed'}`;
+  return `${quota.provider} | ${quota.windows.map((w) => `${w.label ?? w.type}: ${w.usedPercent === null ? 'unknown usage' : w.usedPercent.toFixed(1) + '% used'}; reset ${humanTime(w.resetAt)}`).join(' | ')} | ${quota.available ? 'available' : 'recovery not confirmed'}`;
 }
 
 export default function (pi) {
@@ -90,24 +47,27 @@ export default function (pi) {
   const configPath = join(root, 'quota-auto-continue.json');
   let cfg = loadConfig(configPath);
   let context = null;
+  let activeSessionId = null;
   let pending = null;
   let lastError = null;
-  let lastHttpResetAt = null;
+  let lastResetHint = null;
   let timer = null;
   let generation = 0;
   let resumeCount = 0;
+  let episodeAnnounced = false;
+  let limitReported = false;
   let probingGeneration = null;
   let lastQuota = null;
+  let savedState = null;
 
   const sessionId = (ctx) => ctx?.sessionManager?.getSessionId?.();
-  const modelKey = (ctx) => `${ctx?.model?.provider ?? ''}/${ctx?.model?.id ?? ''}`;
-  const status = (ctx, text) => { try { if (ctx?.hasUI) ctx.ui.setStatus('quota-auto-continue', text || undefined); } catch {} };
-  const notify = (ctx, text, level = 'info') => { try { if (ctx?.hasUI) ctx.ui.notify(text, level); else console.log(`[quota-auto-continue] ${text}`); } catch {} };
+  const modelKey = (model) => `${model?.provider ?? ''}/${model?.id ?? ''}@${model?.baseUrl ?? ''}`;
+  const status = (ctx, text) => { try { if (ctx?.hasUI) ctx.ui.setStatus(STATE_TYPE, text || undefined); } catch {} };
+  const notify = (ctx, text, level = 'info') => { try { if (ctx?.hasUI) ctx.ui.notify(text, level); else console.log(`[${STATE_TYPE}] ${text}`); } catch {} };
 
   function nativeSession(ctx) {
     const session = pi.pi?.AgentRegistry?.global?.().get(ctx.agent?.id)?.session;
-    // Match the actual manager, not just a reusable agent ID or a session filename.
-    if (session?.sessionManager !== ctx.sessionManager || typeof session.retry !== 'function') {
+    if (!session || !sessionId(ctx) || session.sessionManager?.getSessionId?.() !== sessionId(ctx) || typeof session.retry !== 'function') {
       throw new Error('This host does not expose native session retry. OMP 18.12.1 or a compatible host is required; no message fallback is used.');
     }
     return session;
@@ -120,61 +80,113 @@ export default function (pi) {
     renameSync(temp, configPath);
   }
 
+  function persistState(state) {
+    const serialized = JSON.stringify(state);
+    if (serialized === savedState) return;
+    // Custom entries are session metadata, never user/custom messages or model context.
+    pi.appendEntry?.(STATE_TYPE, state);
+    savedState = serialized;
+  }
+  function persistWait(state = 'waiting') {
+    if (!pending) return;
+    persistState({ version: 1, state, sessionId: pending.sessionId, modelKey: pending.modelKey,
+      detectedAt: pending.detectedAt, resetAt: pending.resetAt, hintResetAt: pending.hintResetAt,
+      attempts: resumeCount, announced: episodeAnnounced });
+  }
   function clearTimer() { clearTimeout(timer); timer = null; }
-  function cancel(ctx, why = '') {
+  function cancel(ctx, why = '', persist = true) {
+    if (persist && (pending || episodeAnnounced || resumeCount)) persistState({ version: 1, state: 'cancelled' });
     generation++;
     clearTimer();
     pending = null;
     lastError = null;
-    lastHttpResetAt = null;
+    lastResetHint = null;
     resumeCount = 0;
+    episodeAnnounced = false;
+    limitReported = false;
     status(ctx, '');
     if (why) notify(ctx, `Automatic continuation cancelled: ${why}`);
   }
   function checkContext(ctx) {
-    return !!pending && pending.sessionId === sessionId(ctx) && pending.modelKey === modelKey(ctx);
+    if (!pending || pending.sessionId !== sessionId(ctx)) return false;
+    try { return pending.modelKey === modelKey(nativeSession(ctx).model ?? ctx.model); }
+    catch { return false; }
   }
   function schedule(ms) {
     clearTimer();
     if (!pending || !cfg.enabled) return;
+    pending.nextCheckAt = null;
+    if (!Number.isFinite(ms)) return;
     const gen = generation;
-    pending.nextCheckAt = Date.now() + Math.max(500, ms);
+    const delay = Math.max(500, Math.min(ms, 2147483647));
+    pending.nextCheckAt = Date.now() + delay;
     timer = setTimeout(() => {
       if (gen !== generation) return;
       void probe(gen).catch(() => {
         if (gen === generation) cancel(context, 'Unexpected monitoring failure; run /quota-resume check.');
       });
-    }, Math.max(500, Math.min(ms, 2147483647)));
+    }, delay);
     timer?.unref?.();
   }
-  function timing() {
-    return `Next automatic continuation: ${pending.resumeAt ? `${humanTime(pending.resumeAt)} (estimated; requires quota recovery)` : 'unknown until recovery is confirmed'}. Next recovery check: ${humanTime(pending.nextCheckAt)}. Background polling: every ${cfg.pollMinutes} minutes.`;
+  function scheduleNext() {
+    const now = Date.now();
+    const periodic = cfg.pollMinutes > 0 ? cfg.pollMinutes * 60000 : Infinity;
+    const deadline = pending.resumeAt && pending.resumeAt > now ? pending.resumeAt - now : Infinity;
+    schedule(pending.ready ? Math.max(500, (pending.resumeAt ?? now) - now) : Math.min(periodic, deadline));
   }
-  function reportSchedule(ctx, force = false) {
-    status(ctx, `Quota: ${pending.resumeAt ? humanTime(pending.resumeAt) : 'waiting for recovery'} | next check ${humanTime(pending.nextCheckAt)}`);
-    if (force || pending.announcedResumeAt !== pending.resumeAt) {
-      notify(ctx, `${pending.announcedResumeAt === undefined ? 'Quota limit detected.' : 'Continuation schedule updated.'} ${timing()}`, 'warning');
-      pending.announcedResumeAt = pending.resumeAt;
+  function timing() {
+    return `Next automatic continuation: ${pending.resumeAt ? `${humanTime(pending.resumeAt)} (estimated; requires quota recovery)` : 'unknown until recovery is confirmed'}. Next recovery check: ${pending.nextCheckAt ? humanTime(pending.nextCheckAt) : 'manual check only until a reset time is known'}. Background polling: ${cfg.pollMinutes ? `every ${cfg.pollMinutes} minutes` : 'off'}.`;
+  }
+  function reportSchedule(ctx) {
+    status(ctx, `Quota: ${pending.resumeAt ? humanTime(pending.resumeAt) : 'waiting for recovery'} | ${pending.nextCheckAt ? `next check ${humanTime(pending.nextCheckAt)}` : 'periodic checks off'}`);
+    if (!episodeAnnounced) {
+      notify(ctx, `${pending.provider} quota limit detected; automatic recovery is armed. ${timing()}`, 'warning');
+      episodeAnnounced = true;
     }
+    persistWait();
   }
 
-  async function continueTask(ctx, recovered = true) {
-    if (!pending || !checkContext(ctx) || !cfg.enabled) return;
-    if (!ctx.isIdle()) { schedule(3000); reportSchedule(ctx); return; }
-    if (ctx.hasPendingMessages?.()) { cancel(ctx, 'New messages are pending.'); return; }
+  function lastConversationMessage(ctx) {
+    const entries = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries?.() ?? [];
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const message = entries[i].type === 'message' ? entries[i].message : null;
+      if (message?.role === 'user' || message?.role === 'assistant') return message;
+    }
+    return null;
+  }
+
+  async function continueTask(ctx) {
+    if (!pending || !checkContext(ctx) || !cfg.enabled || pending.dispatching) return;
+    const session = nativeSession(ctx);
+    if (!ctx.isIdle() || session.isCompacting || session.isRetrying || ctx.hasPendingMessages?.()) {
+      schedule(3000);
+      status(ctx, 'Quota recovered; waiting for the host to become idle.');
+      return;
+    }
     if (resumeCount >= cfg.maxResumesPerEpisode) { cancel(ctx, 'The continuation attempt limit was reached.'); return; }
-    let session;
-    try { session = nativeSession(ctx); } catch (err) { cancel(ctx, err.message); return; }
-    resumeCount++;
-    pending = null;
+    const gen = generation;
+    const waiting = pending;
+    waiting.dispatching = true;
     clearTimer();
-    const gen = ++generation;
-    lastError = null;
-    status(ctx, '');
-    notify(ctx, `${recovered ? 'Quota recovery detected.' : 'Provider reset hint reached; the quota endpoint is unavailable.'} Next automatic continuation: ${humanTime(Date.now())} (now; attempt ${resumeCount}/${cfg.maxResumesPerEpisode}). Retrying the interrupted turn without adding a message. If quota blocks it again, a new continuation time will be reported.`);
     try {
       const accepted = await session.retry();
-      if (!accepted && gen === generation) cancel(ctx, 'The host declined native retry; the interrupted turn may no longer be retryable.');
+      if (gen !== generation || pending !== waiting) return;
+      waiting.dispatching = false;
+      if (!accepted) {
+        const tail = lastConversationMessage(ctx);
+        if (tail && !asError(tail)) { cancel(ctx, 'The failed quota turn was superseded.'); return; }
+        // Prompt unwind/compaction can refuse admission even when isIdle() was true.
+        schedule(3000);
+        status(ctx, 'Quota recovered; native retry admission is deferred.');
+        return;
+      }
+      resumeCount++;
+      persistWait('retrying');
+      pending = null;
+      generation++;
+      lastError = null;
+      status(ctx, '');
+      notify(ctx, `${waiting.recovered ? 'Quota recovery confirmed.' : 'Provider reset hint reached; the usage endpoint is unavailable.'} Automatic continuation: ${humanTime(Date.now())} (now; attempt ${resumeCount}/${cfg.maxResumesPerEpisode}). Native retry accepted without adding a message.`);
     } catch {
       if (gen === generation) cancel(ctx, 'Native retry failed; inspect the host error before retrying manually.');
     }
@@ -186,101 +198,176 @@ export default function (pi) {
     if (!checkContext(ctx)) { cancel(ctx, 'The session or model changed.'); return; }
     probingGeneration = gen;
     try {
+      const safeAt = pending.detectedAt + cfg.minResumeDelaySeconds * 1000;
+      if (pending.ready && allowResume && Date.now() >= safeAt) { await continueTask(ctx); return; }
       let quota = null;
       let probeError = null;
-      try { quota = await fetchCodexQuota(ctx); }
-      catch (err) { probeError = String(err?.message || err); }
+      const model = nativeSession(ctx).model ?? ctx.model;
+      try { quota = await fetchQuota({ model, modelRegistry: ctx.modelRegistry }); }
+      catch (err) {
+        if (gen !== generation || !pending || !checkContext(ctx)) return;
+        if (err instanceof UnsupportedQuotaProviderError) { cancel(ctx, err.message); return; }
+        probeError = String(err?.message || err);
+      }
       if (gen !== generation || !pending || !checkContext(ctx)) return;
       pending.lastProbeError = probeError;
       if (quota) lastQuota = quota;
       const now = Date.now();
-      const safeAt = pending.detectedAt + cfg.minResumeDelaySeconds * 1000;
       if (quota?.available) {
+        pending.ready = true;
+        pending.recovered = true;
         pending.resumeAt = Math.max(now, safeAt);
         if (allowResume && now >= safeAt) { await continueTask(ctx); return; }
-        schedule(Math.max(500, safeAt - now));
+        scheduleNext();
         reportSchedule(ctx);
         return;
       }
-      // An authoritative blocked response always takes precedence over an old hint.
       if (quota) pending.resetAt = quota.nextResetAt;
       const resetAt = pending.resetAt ? pending.resetAt + cfg.resetSlackSeconds * 1000 : null;
       const hintAt = pending.hintResetAt ? Math.max(safeAt, pending.hintResetAt + cfg.resetSlackSeconds * 1000, resetAt ?? 0) : null;
-      if (!quota && cfg.resumeAtHintIfUsageUnavailable && hintAt && now >= hintAt && allowResume) {
-        await continueTask(ctx, false);
-        return;
-      }
-      pending.resumeAt = resetAt && resetAt > now ? Math.max(safeAt, resetAt) : null;
-      const next = Math.min(cfg.pollMinutes * 60000, pending.resumeAt ? pending.resumeAt - now : Infinity);
-      schedule(Math.max(500, next));
+      if (!quota && cfg.resumeAtHintIfUsageUnavailable && hintAt && now >= hintAt) {
+        pending.ready = true;
+        pending.recovered = false;
+        pending.resumeAt = Math.max(now, safeAt);
+        if (allowResume) { await continueTask(ctx); return; }
+      } else pending.resumeAt = resetAt && resetAt > now ? Math.max(safeAt, resetAt) : null;
+      scheduleNext();
       reportSchedule(ctx);
     } finally {
       if (probingGeneration === gen) probingGeneration = null;
     }
   }
 
-  async function startWait(ctx, errorText) {
+  async function startWait(ctx, errorText, restored = null) {
     if (!cfg.enabled) return;
-    try { checkProvider(ctx); nativeSession(ctx); }
+    let provider;
+    try { provider = checkProvider(ctx); nativeSession(ctx); }
     catch (err) { notify(ctx, `Quota limit detected. Automatic continuation unavailable: ${err.message}`, 'warning'); return; }
     if (resumeCount >= cfg.maxResumesPerEpisode) {
-      notify(ctx, 'Quota is still blocked. No next automatic continuation: the attempt limit was reached.', 'warning');
+      status(ctx, 'Automatic quota recovery stopped: accepted-attempt limit reached.');
+      if (!limitReported) notify(ctx, 'No next automatic continuation: the accepted-attempt limit was reached. Use /quota-resume check or retry manually.');
+      limitReported = true;
       return;
     }
-    const hinted = [parseResetHint(errorText), lastHttpResetAt].filter((x) => x && x > Date.now() - 60000);
+    const key = modelKey(nativeSession(ctx).model ?? ctx.model);
+    const hinted = [parseResetHint(errorText), restored?.hintResetAt,
+      lastResetHint?.sessionId === sessionId(ctx) && lastResetHint.modelKey === key ? lastResetHint.at : null]
+      .filter((at) => Number.isFinite(at) && at > 0);
     const time = hinted.length ? Math.max(...hinted) : null;
     const gen = ++generation;
     clearTimer();
     context = ctx;
     pending = {
-      sessionId: sessionId(ctx), modelKey: modelKey(ctx), detectedAt: Date.now(),
-      resetAt: time, hintResetAt: time, resumeAt: time ? Math.max(time + cfg.resetSlackSeconds * 1000, Date.now() + cfg.minResumeDelaySeconds * 1000) : null,
-      nextCheckAt: Date.now(), lastProbeError: null, announcedResumeAt: undefined,
+      provider, sessionId: sessionId(ctx), modelKey: key,
+      detectedAt: Number.isFinite(restored?.detectedAt) ? restored.detectedAt : Date.now(),
+      resetAt: Number.isFinite(restored?.resetAt) ? restored.resetAt : time,
+      hintResetAt: time, resumeAt: null, nextCheckAt: null, lastProbeError: null,
+      ready: false, recovered: false, dispatching: false,
     };
-    reportSchedule(ctx);
-    // Never re-enter native retry from within a settlement hook.
+    persistWait();
+    status(ctx, 'Quota limit detected; checking the recovery schedule.');
+    // Publish exactly one notice after the initial request resolves; never retry inside this hook.
     await probe(gen, false);
+  }
+
+  async function restoreWait(ctx) {
+    if (!cfg.enabled) return;
+    const entries = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries?.() ?? [];
+    let restored = null;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].type === 'custom' && entries[i].customType === STATE_TYPE) { restored = entries[i].data; break; }
+    }
+    if (restored && (restored.version !== 1 || !['waiting', 'retrying'].includes(restored.state)
+      || restored.sessionId !== sessionId(ctx) || restored.modelKey !== modelKey(ctx.model))) return;
+    const error = asError(lastConversationMessage(ctx));
+    if (!error) return;
+    if (restored) {
+      resumeCount = Number.isInteger(restored.attempts) ? Math.max(0, restored.attempts) : 0;
+      episodeAnnounced = restored.announced === true;
+      savedState = JSON.stringify(restored);
+    }
+    // Also recover pre-0.3.0 sessions whose failed quota tail predates recovery metadata.
+    await startWait(ctx, error, restored);
   }
 
   function noticeError(message, ctx) {
     const error = asError(message);
-    if (error) lastError = { text: error, sessionId: sessionId(ctx), modelKey: modelKey(ctx) };
+    if (error) lastError = { text: error, sessionId: sessionId(ctx), modelKey: modelKey(ctx.model) };
     else if (message?.role === 'assistant') lastError = null;
   }
+  function rememberHint(ctx, at) {
+    if (!Number.isFinite(at) || at <= 0) return;
+    const key = modelKey(ctx.model);
+    const same = lastResetHint?.sessionId === sessionId(ctx) && lastResetHint.modelKey === key;
+    lastResetHint = { sessionId: sessionId(ctx), modelKey: key, at: same ? Math.max(lastResetHint.at, at) : at };
+    if (pending && pending.sessionId === sessionId(ctx) && pending.modelKey === key) {
+      pending.hintResetAt = Math.max(pending.hintResetAt ?? 0, at);
+      if (!pending.resetAt) pending.resetAt = at;
+      if (!pending.ready && pending.resetAt) {
+        pending.resumeAt = Math.max(pending.detectedAt + cfg.minResumeDelaySeconds * 1000, pending.resetAt + cfg.resetSlackSeconds * 1000);
+        scheduleNext();
+        if (episodeAnnounced) reportSchedule(ctx);
+      }
+      persistWait();
+    }
+  }
 
-  pi.on('session_start', (_event, ctx) => { cfg = loadConfig(configPath); context = ctx; cancel(ctx); });
-  pi.on('session_shutdown', (_event, ctx) => { cancel(ctx); context = null; });
-  pi.on('session_switch', (_event, ctx) => { cancel(ctx); context = ctx; });
-  pi.on('model_select', (_event, ctx) => { if (pending) cancel(ctx, 'The model changed.'); });
+  pi.on('session_start', async (_event, ctx) => {
+    cfg = loadConfig(configPath);
+    cancel(ctx, '', false);
+    context = ctx;
+    activeSessionId = sessionId(ctx);
+    lastQuota = null;
+    savedState = null;
+    await restoreWait(ctx);
+  });
+  pi.on('session_shutdown', (_event, ctx) => { cancel(ctx, '', false); context = null; });
+  pi.on('session_switch', async (_event, ctx) => {
+    if (activeSessionId === sessionId(ctx)) return;
+    cancel(ctx, '', false);
+    context = ctx;
+    activeSessionId = sessionId(ctx);
+    savedState = null;
+    lastQuota = null;
+    await restoreWait(ctx);
+  });
+  pi.on('model_select', (_event, ctx) => { lastQuota = null; if (pending) cancel(ctx, 'The model changed.'); });
   pi.on('input', (event, ctx) => {
-    // User input always takes priority, including input racing an in-flight quota request.
     if (event.source !== 'extension') cancel(ctx, pending ? 'New user input received.' : '');
   });
-  pi.on('after_provider_response', (event) => {
+  pi.on('after_provider_response', (event, ctx) => {
     if (event.status !== 429) return;
     const value = headerValue(event.headers, 'retry-after');
     if (!value) return;
     const seconds = Number(value);
-    lastHttpResetAt = Number.isFinite(seconds) && seconds >= 0 ? Date.now() + seconds * 1000 : Date.parse(value);
-    if (!Number.isFinite(lastHttpResetAt)) lastHttpResetAt = null;
+    rememberHint(ctx, Number.isFinite(seconds) && seconds >= 0 ? Date.now() + seconds * 1000 : Date.parse(value));
+  });
+  pi.on('auto_retry_end', (event, ctx) => {
+    if (event.success !== false || !isQuotaError(event.finalError)) return;
+    // OMP may learn a multi-hour wait after the assistant error was already finalized.
+    rememberHint(ctx, parseResetHint(event.finalError));
   });
   pi.on('message_end', (event, ctx) => noticeError(event.message, ctx));
   pi.on('turn_end', (event, ctx) => noticeError(event.message, ctx));
   pi.on('agent_end', async (event, ctx) => {
-    const message = event.messages?.findLast((m) => m?.role === 'assistant');
+    const message = event.messages?.findLast((item) => item?.role === 'assistant');
     if (message?.stopReason === 'aborted') { cancel(ctx); return; }
     if (message) noticeError(message, ctx);
-    // OMP emits nonterminal agent_end notifications before host-managed recovery.
-    if (event.willContinue || event.willRetry || pending || !cfg.enabled) return;
-    if (!lastError) { resumeCount = 0; lastHttpResetAt = null; return; }
+    if (event.willContinue || event.willRetry || !cfg.enabled) return;
+    if (pending) {
+      if (message && !asError(message)) cancel(ctx);
+      else if (pending.ready) schedule(500);
+      return;
+    }
+    if (!lastError) { cancel(ctx); return; }
     const error = lastError;
     lastError = null;
-    if (error.sessionId !== sessionId(ctx) || error.modelKey !== modelKey(ctx)) return;
+    if (error.sessionId !== sessionId(ctx) || error.modelKey !== modelKey(ctx.model)) return;
     await startWait(ctx, error.text);
   });
 
   pi.registerCommand('quota-resume', {
-    description: 'Codex quota monitor: status | check | on | off | cancel | interval <minutes>',
+    description: 'Codex / Claude Code quota monitor: status | check | on | off | cancel | interval <minutes; 0 disables periodic checks>',
     handler: async (args, ctx) => {
       const [cmd = 'status', val] = String(args || '').trim().split(/\s+/);
       context = ctx;
@@ -293,23 +380,23 @@ export default function (pi) {
         cancel(ctx, 'Cancelled by the user.');
       } else if (cmd === 'interval') {
         const minutes = Number(val);
-        if (!Number.isFinite(minutes) || minutes < 0.25 || minutes > 60) {
-          notify(ctx, 'The interval must be between 0.25 and 60 minutes, for example /quota-resume interval 10.', 'warning'); return;
+        if (!Number.isFinite(minutes) || (minutes !== 0 && (minutes < 0.25 || minutes > 60))) {
+          notify(ctx, 'Use interval 0 to disable periodic checks, or 0.25–60 minutes; default: 30.', 'warning'); return;
         }
         cfg.pollMinutes = minutes;
         saveConfig();
-        notify(ctx, `Background polling interval: ${minutes} minutes.`);
-        if (pending) { schedule(500); reportSchedule(ctx, true); }
+        if (pending) { scheduleNext(); reportSchedule(ctx); }
+        notify(ctx, `Background polling: ${minutes ? `every ${minutes} minutes` : 'off; known reset checks and manual checks remain enabled'}.`);
       } else if (cmd === 'check') {
         if (pending) { await probe(generation); if (pending) notify(ctx, `${fmtQuota(lastQuota)} ${timing()}${pending.lastProbeError ? ` Last check: ${pending.lastProbeError}` : ''}`); }
         else {
-          try { lastQuota = await fetchCodexQuota(ctx); notify(ctx, fmtQuota(lastQuota)); }
+          try { lastQuota = await fetchQuota(ctx); notify(ctx, fmtQuota(lastQuota)); }
           catch (err) { notify(ctx, `Quota check failed: ${String(err?.message || err)}`, 'warning'); }
         }
       } else if (cmd === 'status') {
-        notify(ctx, `Automatic continuation: ${cfg.enabled ? 'on' : 'off'}. ${pending ? timing() : 'No pending continuation.'} Attempts: ${resumeCount}/${cfg.maxResumesPerEpisode}. ${fmtQuota(lastQuota)}${pending?.lastProbeError ? ` Last check: ${pending.lastProbeError}` : ''}`);
+        notify(ctx, `Automatic continuation: ${cfg.enabled ? 'on' : 'off'}. ${pending ? timing() : `No pending continuation. Background polling: ${cfg.pollMinutes ? `${cfg.pollMinutes} minutes` : 'off'}.`} Attempts: ${resumeCount}/${cfg.maxResumesPerEpisode}. ${fmtQuota(lastQuota)}${pending?.lastProbeError ? ` Last check: ${pending.lastProbeError}` : ''}`);
       } else {
-        notify(ctx, 'Usage: /quota-resume status | check | on | off | cancel | interval 10', 'warning');
+        notify(ctx, 'Usage: /quota-resume status | check | on | off | cancel | interval 30 | interval 0', 'warning');
       }
     },
   });
