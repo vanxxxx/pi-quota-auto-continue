@@ -1,0 +1,45 @@
+{
+  "name": "pi-quota-auto-continue",
+  "version": "0.2.0",
+  "description": "Native Codex OAuth quota recovery for Oh My Pi without continuation messages",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vanxxxx/pi-quota-auto-continue.git"
+  },
+  "homepage": "https://github.com/vanxxxx/pi-quota-auto-continue#readme",
+  "bugs": {
+    "url": "https://github.com/vanxxxx/pi-quota-auto-continue/issues"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "files": [
+    "src/",
+    "examples/",
+    "README.md"
+  ],
+  "keywords": [
+    "pi-package",
+    "omp",
+    "pi-extension",
+    "codex",
+    "quota",
+    "auto-continue"
+  ],
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm test"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

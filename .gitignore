@@ -1,0 +1,15 @@
+node_modules/
+*.tgz
+coverage/
+.nyc_output/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+/auth.json
+/quota-auto-continue.json
+.pi/
+.omp/
+.DS_Store
+Thumbs.db

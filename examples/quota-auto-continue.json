@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "pollMinutes": 10,
+  "resetSlackSeconds": 5,
+  "minResumeDelaySeconds": 20,
+  "maxResumesPerEpisode": 3,
+  "resumeAtHintIfUsageUnavailable": true
+}
