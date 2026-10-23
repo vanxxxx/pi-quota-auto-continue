@@ -147,6 +147,8 @@ Maintainer release instructions for `pi-quota-auto-continue`. Publishing require
 
 Review the package name/version and licensing before release, then run:
 
+npm login alone is not sufficient for publishing. Enable two-factor authentication on the publishing account and complete the interactive challenge, or use a granular access token with package write permission and Bypass 2FA enabled. Keep tokens, one-time passwords, and recovery codes out of the repository.
+
 ```sh
 npm login
 npm test
